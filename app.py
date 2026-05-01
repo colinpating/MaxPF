@@ -376,8 +376,8 @@ if "results" in st.session_state:
 
     # Clay vs Sleeper discrepancies
     if discrepancies:
-        with st.expander(f"⚠ {len(discrepancies)} players where Clay & Sleeper disagree by ≥20%"):
-            st.caption("Projections shown are the average of both sources. Large gaps may reflect injuries, role changes, or differing methodologies.")
+        with st.expander(f"⚠ {len(discrepancies)} meaningful Clay vs Sleeper disagreements (≥4 pts/game avg, ≥2 pts apart)"):
+            st.caption("Sorted by absolute gap. Projections used are the average of both sources. Large gaps may reflect injuries, role changes, or differing methodologies.")
             disc_df = pd.DataFrame(discrepancies)
             st.dataframe(disc_df, use_container_width=True, hide_index=True)
 

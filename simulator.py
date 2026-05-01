@@ -102,16 +102,21 @@ def build_team_sim_data(
             pts_pg = proj.pts_per_game
             std_pg = pts_pg * CV_BY_POSITION.get(position, DEFAULT_CV)
             if proj.source == "average" and proj.clay_pts_per_game > 0:
-                diff_pct = (proj.sleeper_pts_per_game - proj.clay_pts_per_game) / proj.clay_pts_per_game
-                if abs(diff_pct) >= 0.20:
+                abs_diff = abs(proj.clay_pts_per_game - proj.sleeper_pts_per_game)
+                avg_ppg = proj.pts_per_game
+                # Only flag players who matter: meaningful projection AND sizeable abs gap
+                if avg_ppg >= 4.0 and abs_diff >= 2.0:
+                    diff_pct = (proj.sleeper_pts_per_game - proj.clay_pts_per_game) / proj.clay_pts_per_game
                     discrepancies.append({
                         "Player": proj.player_name,
                         "Pos": proj.position,
                         "Team": proj.team,
                         "Clay": round(proj.clay_pts_per_game, 1),
                         "Sleeper": round(proj.sleeper_pts_per_game, 1),
-                        "Avg Used": round(proj.pts_per_game, 1),
-                        "Diff": f"{diff_pct:+.0%}",
+                        "Avg Used": round(avg_ppg, 1),
+                        "Diff (pts)": round(proj.sleeper_pts_per_game - proj.clay_pts_per_game, 1),
+                        "Diff (%)": f"{diff_pct:+.0%}",
+                        "_abs_diff": abs_diff,
                     })
 
         player_ids.append(pid)
@@ -253,5 +258,7 @@ def run_simulation(
                 print(f"  Roster {roster_id}: {', '.join(sample)}" + (f" (+{len(names)-5} more)" if len(names) > 5 else ""))
 
     results.sort(key=lambda r: r.mean_maxpf)
-    disc_list = sorted(seen_discrepancies.values(), key=lambda d: abs(float(d["Diff"].rstrip("%"))), reverse=True)
+    disc_list = sorted(seen_discrepancies.values(), key=lambda d: d["_abs_diff"], reverse=True)
+    for d in disc_list:
+        d.pop("_abs_diff", None)
     return results, disc_list
