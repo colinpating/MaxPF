@@ -293,6 +293,7 @@ def download_pdf(url: str = ESPN_PDF_URL) -> str:
 # ── Sleeper projections ────────────────────────────────────────────────────────
 
 def get_scoring_format(scoring_settings: dict) -> str:
+    """Map league scoring settings to Sleeper's pts field name."""
     rec = float(scoring_settings.get("rec", 0) or 0)
     if rec >= 1.0:
         return "pts_ppr"
