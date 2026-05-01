@@ -1,0 +1,7 @@
+cache/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.csv
+.claude/

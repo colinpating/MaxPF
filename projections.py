@@ -1,0 +1,354 @@
+"""
+Parse Mike Clay ESPN projections PDF.
+
+Reads the pre-calculated FF Pt (fantasy points) column directly from the
+positional projection pages (pages 35–57). No stat re-calculation needed.
+
+Page layout:
+  35      → Quarterback Projections
+  36–38   → Running Back Projections
+  39–43   → Wide Receiver Projections
+  44–45   → Tight End Projections
+  57      → Kicker Projections
+  (no team-DEF fantasy page; DEF uses a flat default)
+"""
+
+import os
+import re
+import unicodedata
+from dataclasses import dataclass
+
+import requests
+
+CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
+PDF_CACHE = os.path.join(CACHE_DIR, "clay_projections.pdf")
+ESPN_PDF_URL = "https://g.espncdn.com/s/ffldraftkit/26/NFLDK2026_CS_ClayProjections2026.pdf"
+
+# Page ranges for each position (0-based indices)
+POSITION_PAGES = {
+    "QB":  list(range(34, 35)),   # page 35
+    "RB":  list(range(35, 38)),   # pages 36–38
+    "WR":  list(range(38, 43)),   # pages 39–43
+    "TE":  list(range(43, 45)),   # pages 44–45
+    "K":   list(range(56, 57)),   # page 57
+}
+
+# Average DEF pts per game (no Clay DEF fantasy page exists)
+DEF_DEFAULT_PTS_PER_GAME = 7.5
+
+# Team abbreviations used by Clay → Sleeper equivalents
+TEAM_ALIASES = {
+    "ARZ": "ARI",
+    "BLT": "BAL",
+    "CLV": "CLE",
+    "HST": "HOU",
+    "JAC": "JAX",
+    "LA":  "LAR",
+    "WSH": "WAS",
+    "GBP": "GB",
+    "KCC": "KC",
+    "NOR": "NO",
+    "NEP": "NE",
+    "SFO": "SF",
+    "TBB": "TB",
+    "SDC": "LAC",
+}
+
+# All valid Clay team abbreviations (used to locate team token in text lines)
+KNOWN_TEAMS = {
+    "ARZ", "ATL", "BLT", "BUF", "CHI", "CIN", "CLV", "DAL", "DEN", "DET",
+    "GB",  "HST", "IND", "JAX", "KC",  "LAC", "LAR", "LV",  "MIA", "MIN",
+    "NE",  "NO",  "NYG", "NYJ", "PHI", "PIT", "SEA", "SF",  "TB",  "TEN",
+    "WAS", "JAC",
+}
+
+# Tokens that look like team abbreviations but aren't
+NOT_TEAMS = {
+    "FF", "PT", "TD", "YD", "ATT", "RK", "TM", "G", "INT", "SK",
+    "FGM", "FGA", "XPM", "XPA", "IDP", "QB", "RB", "WR", "TE",
+    "LB", "CB", "DB", "DL", "SS", "FS", "DE", "DT", "NT",
+    "TFL", "QBH", "PBU", "CAR", "REC",
+}
+
+
+@dataclass
+class PlayerProjection:
+    player_name: str
+    team: str
+    position: str
+    games: float = 17.0
+    pts_season: float = 0.0    # FF Pt from PDF (season total)
+    pts_per_game: float = 0.0  # pts_season / games
+
+
+# ── Utilities ──────────────────────────────────────────────────────────────────
+
+def normalize_name(name: str) -> str:
+    name = unicodedata.normalize("NFKD", name)
+    name = name.encode("ascii", "ignore").decode("ascii")
+    name = name.lower().strip()
+    name = re.sub(r"\s+(jr|sr|ii|iii|iv|v)\.?$", "", name)
+    name = re.sub(r"[^a-z\s]", "", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
+
+
+def normalize_team(team: str) -> str:
+    if not team:
+        return ""
+    t = team.upper().strip()
+    return TEAM_ALIASES.get(t, t)
+
+
+def _safe_float(val) -> float:
+    if val is None:
+        return 0.0
+    try:
+        return float(str(val).replace(",", "").replace("%", "").strip())
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _find_team_idx(tokens: list[str]) -> int | None:
+    """Return index of the first token that is a known team abbreviation."""
+    for i, tok in enumerate(tokens):
+        upper = tok.upper().rstrip(".")
+        if upper in KNOWN_TEAMS and upper not in NOT_TEAMS and i > 0:
+            return i
+    return None
+
+
+# ── Line parsers ───────────────────────────────────────────────────────────────
+
+def _parse_skill_line(line: str, position: str) -> PlayerProjection | None:
+    """
+    Parse a skill-position data line.
+    Format: [Name...] [TEAM] [PosRank] [FF_Pt] [G] ...
+    Example: "Josh Allen BUF 1 360 17 498 331 ..."
+    """
+    tokens = line.split()
+    if len(tokens) < 5:
+        return None
+
+    team_idx = _find_team_idx(tokens)
+    if team_idx is None or team_idx == 0:
+        return None
+
+    name = " ".join(tokens[:team_idx]).strip()
+    team = normalize_team(tokens[team_idx])
+
+    # After team: PosRank, FF_Pt, G
+    remaining = tokens[team_idx + 1:]
+    if len(remaining) < 3:
+        return None
+
+    # PosRank should be a small integer (1–200)
+    rank_str = remaining[0]
+    if not re.match(r"^\d+$", rank_str):
+        return None
+
+    pts = _safe_float(remaining[1])
+    games = _safe_float(remaining[2]) or 17.0
+
+    if pts <= 0 or not name or len(name) < 2:
+        return None
+
+    proj = PlayerProjection(
+        player_name=name, team=team, position=position,
+        games=games, pts_season=pts,
+    )
+    proj.pts_per_game = pts / games
+    return proj
+
+
+def _parse_kicker_line(line: str) -> PlayerProjection | None:
+    """
+    Parse a kicker data line.
+    Format: [Name...] [TEAM] [FF_Pt] [FGM] [FGA] ...
+    Example: "Brandon Aubrey DAL 172 36 40 90% ..."
+    """
+    tokens = line.split()
+    if len(tokens) < 4:
+        return None
+
+    team_idx = _find_team_idx(tokens)
+    if team_idx is None or team_idx == 0:
+        return None
+
+    name = " ".join(tokens[:team_idx]).strip()
+    team = normalize_team(tokens[team_idx])
+
+    remaining = tokens[team_idx + 1:]
+    if not remaining:
+        return None
+
+    pts = _safe_float(remaining[0])
+    if pts <= 0 or not name or len(name) < 2:
+        return None
+
+    proj = PlayerProjection(
+        player_name=name, team=team, position="K",
+        games=17.0, pts_season=pts,
+    )
+    proj.pts_per_game = pts / 17.0
+    return proj
+
+
+# ── PDF parsing ────────────────────────────────────────────────────────────────
+
+def _is_data_line(line: str, position: str) -> bool:
+    """Return True if this line looks like a player data row (not a header)."""
+    line = line.strip()
+    if not line:
+        return False
+    # Skip obvious headers
+    header_starts = (
+        "quarterback", "running back", "wide receiver", "tight end",
+        "kicker", "interior", "edge", "off-ball", "cornerback", "safety",
+        "returner", "player", "name", "team", "rk ", "ff pt", "carry",
+        "passing", "rushing", "receiving", "tackle", "sack",
+    )
+    low = line.lower()
+    if any(low.startswith(h) for h in header_starts):
+        return False
+    # Must have at least one number in it (stats)
+    if not re.search(r"\d", line):
+        return False
+    return True
+
+
+def parse_pdf(pdf_path: str) -> list[PlayerProjection]:
+    try:
+        import pdfplumber
+    except ImportError:
+        raise RuntimeError("pdfplumber not installed. Run: pip install pdfplumber")
+
+    projections = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for position, page_indices in POSITION_PAGES.items():
+            for page_idx in page_indices:
+                if page_idx >= len(pdf.pages):
+                    continue
+                page = pdf.pages[page_idx]
+                text = page.extract_text() or ""
+
+                for line in text.split("\n"):
+                    if not _is_data_line(line, position):
+                        continue
+                    if position == "K":
+                        proj = _parse_kicker_line(line)
+                    else:
+                        proj = _parse_skill_line(line, position)
+                    if proj is not None:
+                        projections.append(proj)
+
+    return projections
+
+
+def pdf_debug_info(pdf_path: str) -> dict:
+    """Return diagnostic info for troubleshooting."""
+    try:
+        import pdfplumber
+        with pdfplumber.open(pdf_path) as pdf:
+            info = {"n_pages": len(pdf.pages), "position_samples": {}}
+            for position, page_indices in POSITION_PAGES.items():
+                samples = []
+                for page_idx in page_indices[:1]:
+                    if page_idx < len(pdf.pages):
+                        text = pdf.pages[page_idx].extract_text() or ""
+                        lines = [l for l in text.split("\n") if _is_data_line(l, position)]
+                        samples = lines[:5]
+                info["position_samples"][position] = samples
+            return info
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ── Download ───────────────────────────────────────────────────────────────────
+
+def download_pdf(url: str = ESPN_PDF_URL) -> str:
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    if os.path.exists(PDF_CACHE):
+        print(f"Using cached PDF: {PDF_CACHE}")
+        return PDF_CACHE
+    print("Downloading Clay projections PDF from ESPN...")
+    headers = {"User-Agent": "Mozilla/5.0"}
+    resp = requests.get(url, timeout=60, stream=True, headers=headers)
+    resp.raise_for_status()
+    with open(PDF_CACHE, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
+    print(f"Saved to {PDF_CACHE}")
+    return PDF_CACHE
+
+
+# ── Load + match ───────────────────────────────────────────────────────────────
+
+def _make_key(name: str, team: str) -> str:
+    return f"{normalize_name(name)}_{normalize_team(team).lower()}"
+
+
+def load_projections(
+    pdf_path: str | None,
+    scoring_settings: dict = None,   # unused; pts come from PDF directly
+    games_per_season: int = 17,
+) -> dict[str, PlayerProjection]:
+    if pdf_path is None:
+        pdf_path = download_pdf()
+
+    raw = parse_pdf(pdf_path)
+    print(f"Parsed {len(raw)} player projections from PDF")
+
+    result = {}
+    for proj in raw:
+        key = _make_key(proj.player_name, proj.team)
+        result[key] = proj
+
+    return result
+
+
+def match_sleeper_player(
+    player_id: str,
+    sleeper_player: dict,
+    projections: dict[str, PlayerProjection],
+) -> PlayerProjection | None:
+    position = sleeper_player.get("position", "")
+    team = normalize_team(sleeper_player.get("team") or "")
+
+    # DEF: return a synthetic flat projection (no Clay DEF page)
+    if position == "DEF":
+        return PlayerProjection(
+            player_name=f"DEF {player_id}",
+            team=player_id,
+            position="DEF",
+            games=17.0,
+            pts_season=DEF_DEFAULT_PTS_PER_GAME * 17,
+            pts_per_game=DEF_DEFAULT_PTS_PER_GAME,
+        )
+
+    full_name = sleeper_player.get("full_name") or (
+        f"{sleeper_player.get('first_name', '')} {sleeper_player.get('last_name', '')}"
+    ).strip()
+
+    # 1. Exact: normalized full name + current team
+    key = _make_key(full_name, team)
+    if key in projections:
+        return projections[key]
+
+    # 2. Name match regardless of team (handles offseason moves)
+    norm_name = normalize_name(full_name)
+    for k, v in projections.items():
+        if k.startswith(norm_name + "_"):
+            return v
+
+    # 3. Last name + team
+    last_name = sleeper_player.get("last_name", "")
+    if last_name and team:
+        norm_last = normalize_name(last_name)
+        norm_team_lower = normalize_team(team).lower()
+        for k, v in projections.items():
+            if k.endswith(f"_{norm_team_lower}") and norm_last in k:
+                return v
+
+    return None
