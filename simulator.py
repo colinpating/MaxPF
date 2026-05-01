@@ -15,16 +15,8 @@ from lineup import (
 )
 from projections import PlayerProjection, match_sleeper_player
 from sleeper import Roster
+from cv_calculator import get_cv, FALLBACK_CV
 
-# Coefficient of variation by position (weekly variance as % of mean)
-CV_BY_POSITION: dict[str, float] = {
-    "QB":  0.35,
-    "RB":  0.55,
-    "WR":  0.55,
-    "TE":  0.60,
-    "K":   0.50,
-    "DEF": 0.65,
-}
 DEFAULT_CV = 0.55
 
 
@@ -61,6 +53,7 @@ def build_team_sim_data(
     lineup_slots: list[LineupSlot],
     include_ir: bool = False,
     sleeper_proj: dict[str, float] | None = None,
+    empirical_cvs: dict | None = None,
 ) -> tuple[TeamSimData, list[str], list[dict]]:
     """
     Returns (TeamSimData, list_of_unmatched_player_names).
@@ -100,7 +93,7 @@ def build_team_sim_data(
                 unmatched.append(f"{name} ({position})")
         else:
             pts_pg = proj.pts_per_game
-            std_pg = pts_pg * CV_BY_POSITION.get(position, DEFAULT_CV)
+            std_pg = pts_pg * get_cv(position, pts_pg, empirical_cvs)
             if proj.source == "average" and proj.clay_pts_per_game > 0:
                 abs_diff = abs(proj.clay_pts_per_game - proj.sleeper_pts_per_game)
                 avg_ppg = proj.pts_per_game
@@ -223,6 +216,7 @@ def run_simulation(
     seed: int | None = None,
     progress_callback=None,
     sleeper_proj: dict[str, float] | None = None,
+    empirical_cvs: dict | None = None,
 ) -> tuple[list[TeamResult], list[dict]]:
     lineup_slots = build_lineup_slots(roster_positions)
     print(f"\nLineup slots: {[s.slot_name for s in lineup_slots]}")
@@ -237,7 +231,7 @@ def run_simulation(
     iterable = tqdm(rosters, desc="Teams", unit="team") if progress_callback is None else rosters
     for i, roster in enumerate(iterable):
         team_data, unmatched, discrepancies = build_team_sim_data(
-            roster, players_db, projections, lineup_slots, include_ir, sleeper_proj
+            roster, players_db, projections, lineup_slots, include_ir, sleeper_proj, empirical_cvs
         )
         if unmatched:
             all_unmatched[roster.roster_id] = unmatched

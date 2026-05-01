@@ -88,6 +88,11 @@ def cached_fetch_sleeper_proj(season: int, scoring_format: str) -> dict:
     from projections import fetch_sleeper_projections
     return fetch_sleeper_projections(season, scoring_format)
 
+@st.cache_data(show_spinner="Computing empirical CVs from historical data...")
+def cached_compute_cvs(hist_season: int, scoring_format: str) -> dict:
+    from cv_calculator import compute_empirical_cvs
+    return compute_empirical_cvs(season=hist_season, scoring_format=scoring_format)
+
 def get_pdf_bytes() -> bytes | None:
     if uploaded_pdf is not None:
         return uploaded_pdf.read()
@@ -256,6 +261,13 @@ if run_btn:
         else:
             st.warning("Sleeper projections unavailable — using Clay only")
 
+        # Empirical CVs from 2024 historical weekly scores
+        empirical_cvs = cached_compute_cvs(2024, scoring_format)
+        if empirical_cvs:
+            st.info(f"Using empirical CVs from 2024 historical data ({', '.join(sorted(empirical_cvs))})")
+        else:
+            st.warning("Empirical CVs unavailable — using fallback flat CVs")
+
         # Simulation with progress bar
         st.write(f"**Running {n_sims:,} simulations × {n_weeks} weeks × {len(rosters)} teams...**")
         progress_bar = st.progress(0, text="Starting simulation...")
@@ -275,11 +287,13 @@ if run_btn:
             use_greedy=use_fast,
             progress_callback=on_progress,
             sleeper_proj=sleeper_proj,
+            empirical_cvs=empirical_cvs,
         )
 
         progress_bar.progress(1.0, text="Done!")
         st.session_state["results"] = results
         st.session_state["discrepancies"] = discrepancies
+        st.session_state["empirical_cvs"] = empirical_cvs
         st.session_state["users"] = users
         st.session_state["rosters"] = rosters
         st.session_state["league"] = league
@@ -373,6 +387,15 @@ if "results" in st.session_state:
             slot_df = pd.DataFrame(slot_rows, columns=["Team"] + slot_labels + ["Total/Wk", "Season Total"])
             st.caption("Avg pts contributed per week by each lineup slot, averaged across all simulations. Season Total = Total/Wk × regular season weeks.")
             st.dataframe(slot_df, use_container_width=True, hide_index=True)
+
+    # Empirical CV tiers
+    empirical_cvs_display = st.session_state.get("empirical_cvs")
+    if empirical_cvs_display:
+        with st.expander("Empirical CV tiers (weekly variance by position & projection level)"):
+            from cv_calculator import cv_summary_table
+            cv_rows = cv_summary_table(empirical_cvs_display)
+            st.caption("CV = std/mean of actual 2024 weekly scores. Lower-projected players are more volatile (higher CV).")
+            st.dataframe(pd.DataFrame(cv_rows), use_container_width=True, hide_index=True)
 
     # Clay vs Sleeper discrepancies
     if discrepancies:
