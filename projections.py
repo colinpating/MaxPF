@@ -13,12 +13,16 @@ Page layout:
   (no team-DEF fantasy page; DEF uses a flat default)
 """
 
+import json
 import os
 import re
+import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 
 import requests
+
+SLEEPER_BASE = "https://api.sleeper.app/v1"
 
 CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache")
 PDF_CACHE = os.path.join(CACHE_DIR, "clay_projections.pdf")
@@ -77,8 +81,11 @@ class PlayerProjection:
     team: str
     position: str
     games: float = 17.0
-    pts_season: float = 0.0    # FF Pt from PDF (season total)
-    pts_per_game: float = 0.0  # pts_season / games
+    pts_season: float = 0.0
+    pts_per_game: float = 0.0
+    clay_pts_per_game: float = 0.0    # 0 when only one source available
+    sleeper_pts_per_game: float = 0.0
+    source: str = "clay"              # "clay" | "sleeper" | "average"
 
 
 # ── Utilities ──────────────────────────────────────────────────────────────────
@@ -283,6 +290,68 @@ def download_pdf(url: str = ESPN_PDF_URL) -> str:
     return PDF_CACHE
 
 
+# ── Sleeper projections ────────────────────────────────────────────────────────
+
+def get_scoring_format(scoring_settings: dict) -> str:
+    rec = float(scoring_settings.get("rec", 0) or 0)
+    if rec >= 1.0:
+        return "pts_ppr"
+    elif rec >= 0.5:
+        return "pts_half_ppr"
+    return "pts_std"
+
+
+def fetch_sleeper_projections(season: int, scoring_format: str = "pts_ppr") -> dict[str, float]:
+    """
+    Fetch Sleeper week-1 projections as a per-game proxy.
+    Returns {player_id: pts_per_game}. Empty dict on failure.
+    Results cached for 7 days.
+    """
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    cache_path = os.path.join(CACHE_DIR, f"sleeper_proj_{season}_{scoring_format}.json")
+    if os.path.exists(cache_path):
+        if (time.time() - os.path.getmtime(cache_path)) / 86400 < 7:
+            with open(cache_path, encoding="utf-8") as f:
+                return json.load(f)
+
+    # Try season-total endpoint first, then weekly as fallback
+    urls = [
+        (f"{SLEEPER_BASE}/projections/nfl/regular/{season}", True),   # season: divide by gp
+        (f"{SLEEPER_BASE}/projections/nfl/regular/{season}/1", False), # week 1: already per-game
+        (f"{SLEEPER_BASE}/projections/nfl/{season}/1", False),
+    ]
+    for url, is_season in urls:
+        try:
+            resp = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            if not data:
+                continue
+            result = {}
+            for pid, stats in data.items():
+                if not isinstance(stats, dict):
+                    continue
+                pts = float(stats.get(scoring_format) or stats.get("pts_ppr") or 0)
+                if pts <= 0:
+                    continue
+                if is_season:
+                    gp = float(stats.get("gp") or 17)
+                    result[pid] = pts / gp
+                else:
+                    result[pid] = pts
+            if result:
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    json.dump(result, f)
+                print(f"Fetched {len(result)} Sleeper projections ({season}, {scoring_format})")
+                return result
+        except Exception:
+            continue
+
+    print(f"Warning: Sleeper projections unavailable for {season} — using Clay only")
+    return {}
+
+
 # ── Load + match ───────────────────────────────────────────────────────────────
 
 def _make_key(name: str, team: str) -> str:
@@ -312,11 +381,12 @@ def match_sleeper_player(
     player_id: str,
     sleeper_player: dict,
     projections: dict[str, PlayerProjection],
+    sleeper_proj: dict[str, float] | None = None,
 ) -> PlayerProjection | None:
     position = sleeper_player.get("position", "")
     team = normalize_team(sleeper_player.get("team") or "")
 
-    # DEF: return a synthetic flat projection (no Clay DEF page)
+    # DEF: synthetic flat projection (no Clay DEF page)
     if position == "DEF":
         return PlayerProjection(
             player_name=f"DEF {player_id}",
@@ -331,24 +401,51 @@ def match_sleeper_player(
         f"{sleeper_player.get('first_name', '')} {sleeper_player.get('last_name', '')}"
     ).strip()
 
-    # 1. Exact: normalized full name + current team
+    # Find Clay projection via name+team, name-only, or last+team
+    clay_proj = None
     key = _make_key(full_name, team)
     if key in projections:
-        return projections[key]
-
-    # 2. Name match regardless of team (handles offseason moves)
-    norm_name = normalize_name(full_name)
-    for k, v in projections.items():
-        if k.startswith(norm_name + "_"):
-            return v
-
-    # 3. Last name + team
-    last_name = sleeper_player.get("last_name", "")
-    if last_name and team:
-        norm_last = normalize_name(last_name)
-        norm_team_lower = normalize_team(team).lower()
+        clay_proj = projections[key]
+    else:
+        norm_name = normalize_name(full_name)
         for k, v in projections.items():
-            if k.endswith(f"_{norm_team_lower}") and norm_last in k:
-                return v
+            if k.startswith(norm_name + "_"):
+                clay_proj = v
+                break
+        if clay_proj is None:
+            last_name = sleeper_player.get("last_name", "")
+            if last_name and team:
+                norm_last = normalize_name(last_name)
+                norm_team_lower = normalize_team(team).lower()
+                for k, v in projections.items():
+                    if k.endswith(f"_{norm_team_lower}") and norm_last in k:
+                        clay_proj = v
+                        break
+
+    sleeper_ppg = float((sleeper_proj or {}).get(player_id) or 0)
+
+    if clay_proj is not None and sleeper_ppg > 0:
+        avg_ppg = (clay_proj.pts_per_game + sleeper_ppg) / 2
+        return dc_replace(
+            clay_proj,
+            pts_per_game=avg_ppg,
+            pts_season=avg_ppg * clay_proj.games,
+            clay_pts_per_game=clay_proj.pts_per_game,
+            sleeper_pts_per_game=sleeper_ppg,
+            source="average",
+        )
+    elif clay_proj is not None:
+        return clay_proj
+    elif sleeper_ppg > 0:
+        return PlayerProjection(
+            player_name=full_name,
+            team=team,
+            position=position,
+            games=17.0,
+            pts_season=sleeper_ppg * 17,
+            pts_per_game=sleeper_ppg,
+            sleeper_pts_per_game=sleeper_ppg,
+            source="sleeper",
+        )
 
     return None

@@ -83,6 +83,11 @@ def cached_load_projections(pdf_bytes: bytes, scoring_settings_json: str):
     finally:
         os.unlink(tmp_path)
 
+@st.cache_data(show_spinner="Fetching Sleeper projections...")
+def cached_fetch_sleeper_proj(season: int, scoring_format: str) -> dict:
+    from projections import fetch_sleeper_projections
+    return fetch_sleeper_projections(season, scoring_format)
+
 def get_pdf_bytes() -> bytes | None:
     if uploaded_pdf is not None:
         return uploaded_pdf.read()
@@ -234,23 +239,32 @@ if run_btn:
                 st.json(debug)
             st.stop()
 
-        st.info(f"Loaded {len(projections):,} player projections")
+        st.info(f"Loaded {len(projections):,} Clay player projections")
         top_proj = sorted(projections.values(), key=lambda p: p.pts_per_game, reverse=True)[:10]
-        with st.expander(f"Top projected players (verify these look right)"):
+        with st.expander("Top projected players (verify these look right)"):
             top_rows = [{"Player": p.player_name, "Team": p.team, "Pos": p.position,
                          "Pts/Game": round(p.pts_per_game, 1)} for p in top_proj]
             st.dataframe(pd.DataFrame(top_rows), hide_index=True, use_container_width=True)
 
+        # Fetch Sleeper projections for consensus averaging
+        import projections as proj_mod
+        scoring_format = proj_mod.get_scoring_format(league.scoring_settings)
+        with st.spinner("Fetching Sleeper projections..."):
+            sleeper_proj = cached_fetch_sleeper_proj(int(league.season or season), scoring_format)
+        if sleeper_proj:
+            st.info(f"Averaging Clay + Sleeper projections ({len(sleeper_proj):,} Sleeper players, {scoring_format})")
+        else:
+            st.warning("Sleeper projections unavailable — using Clay only")
+
         # Simulation with progress bar
         st.write(f"**Running {n_sims:,} simulations × {n_weeks} weeks × {len(rosters)} teams...**")
         progress_bar = st.progress(0, text="Starting simulation...")
-        status_text = st.empty()
 
         def on_progress(completed: int, total: int):
             pct = completed / total
             progress_bar.progress(pct, text=f"Simulating team {completed} of {total}...")
 
-        results = sim.run_simulation(
+        results, discrepancies = sim.run_simulation(
             rosters=rosters,
             players_db=players_db,
             projections=projections,
@@ -260,10 +274,12 @@ if run_btn:
             include_ir=include_ir,
             use_greedy=use_fast,
             progress_callback=on_progress,
+            sleeper_proj=sleeper_proj,
         )
 
         progress_bar.progress(1.0, text="Done!")
         st.session_state["results"] = results
+        st.session_state["discrepancies"] = discrepancies
         st.session_state["users"] = users
         st.session_state["rosters"] = rosters
         st.session_state["league"] = league
@@ -279,12 +295,13 @@ if run_btn:
 
 # ── Display results ────────────────────────────────────────────────────────────
 if "results" in st.session_state:
-    results = st.session_state["results"]
-    users   = st.session_state["users"]
-    rosters = st.session_state["rosters"]
-    league  = st.session_state["league"]
-    n_sims  = st.session_state["n_sims"]
-    n_weeks = st.session_state["n_weeks"]
+    results      = st.session_state["results"]
+    users        = st.session_state["users"]
+    rosters      = st.session_state["rosters"]
+    league       = st.session_state["league"]
+    n_sims       = st.session_state["n_sims"]
+    n_weeks      = st.session_state["n_weeks"]
+    discrepancies = st.session_state.get("discrepancies", [])
 
     df = results_to_dataframe(results, users, rosters)
 
@@ -356,6 +373,13 @@ if "results" in st.session_state:
             slot_df = pd.DataFrame(slot_rows, columns=["Team"] + slot_labels + ["Total/Wk", "Season Total"])
             st.caption("Avg pts contributed per week by each lineup slot, averaged across all simulations. Season Total = Total/Wk × regular season weeks.")
             st.dataframe(slot_df, use_container_width=True, hide_index=True)
+
+    # Clay vs Sleeper discrepancies
+    if discrepancies:
+        with st.expander(f"⚠ {len(discrepancies)} players where Clay & Sleeper disagree by ≥20%"):
+            st.caption("Projections shown are the average of both sources. Large gaps may reflect injuries, role changes, or differing methodologies.")
+            disc_df = pd.DataFrame(discrepancies)
+            st.dataframe(disc_df, use_container_width=True, hide_index=True)
 
     # Unmatched players warning
     unmatched_total = df["Unmatched"].sum()

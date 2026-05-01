@@ -60,7 +60,8 @@ def build_team_sim_data(
     projections: dict[str, PlayerProjection],
     lineup_slots: list[LineupSlot],
     include_ir: bool = False,
-) -> tuple[TeamSimData, list[str]]:
+    sleeper_proj: dict[str, float] | None = None,
+) -> tuple[TeamSimData, list[str], list[dict]]:
     """
     Returns (TeamSimData, list_of_unmatched_player_names).
     Active pool = players + taxi; reserve (IR) excluded unless include_ir=True.
@@ -75,6 +76,7 @@ def build_team_sim_data(
     player_means = []
     player_stds = []
     unmatched = []
+    discrepancies = []
 
     for pid in active_ids:
         sleeper_player = players_db.get(pid)
@@ -89,7 +91,7 @@ def build_team_sim_data(
         if not position:
             continue
 
-        proj = match_sleeper_player(pid, sleeper_player, projections)
+        proj = match_sleeper_player(pid, sleeper_player, projections, sleeper_proj)
         if proj is None or proj.pts_per_game <= 0:
             pts_pg = 0.0
             std_pg = 0.0
@@ -99,6 +101,18 @@ def build_team_sim_data(
         else:
             pts_pg = proj.pts_per_game
             std_pg = pts_pg * CV_BY_POSITION.get(position, DEFAULT_CV)
+            if proj.source == "average" and proj.clay_pts_per_game > 0:
+                diff_pct = (proj.sleeper_pts_per_game - proj.clay_pts_per_game) / proj.clay_pts_per_game
+                if abs(diff_pct) >= 0.20:
+                    discrepancies.append({
+                        "Player": proj.player_name,
+                        "Pos": proj.position,
+                        "Team": proj.team,
+                        "Clay": round(proj.clay_pts_per_game, 1),
+                        "Sleeper": round(proj.sleeper_pts_per_game, 1),
+                        "Avg Used": round(proj.pts_per_game, 1),
+                        "Diff": f"{diff_pct:+.0%}",
+                    })
 
         player_ids.append(pid)
         player_positions.append(position)
@@ -118,7 +132,7 @@ def build_team_sim_data(
         player_stds=stds,
         eligibility_mask=mask,
         lineup_slots=lineup_slots,
-    ), unmatched
+    ), unmatched, discrepancies
 
 
 def simulate_team(
@@ -202,24 +216,28 @@ def run_simulation(
     include_ir: bool = False,
     use_greedy: bool = False,
     seed: int | None = None,
-    progress_callback=None,  # optional fn(completed: int, total: int, team_name: str)
-) -> list[TeamResult]:
+    progress_callback=None,
+    sleeper_proj: dict[str, float] | None = None,
+) -> tuple[list[TeamResult], list[dict]]:
     lineup_slots = build_lineup_slots(roster_positions)
     print(f"\nLineup slots: {[s.slot_name for s in lineup_slots]}")
 
     rng = np.random.default_rng(seed)
     results = []
     all_unmatched = {}
+    seen_discrepancies: dict[str, dict] = {}  # player_name → dict, deduplicated
 
     total = len(rosters)
     print(f"\nSimulating {total} teams x {n_sims} sims x {n_weeks} weeks...")
     iterable = tqdm(rosters, desc="Teams", unit="team") if progress_callback is None else rosters
     for i, roster in enumerate(iterable):
-        team_data, unmatched = build_team_sim_data(
-            roster, players_db, projections, lineup_slots, include_ir
+        team_data, unmatched, discrepancies = build_team_sim_data(
+            roster, players_db, projections, lineup_slots, include_ir, sleeper_proj
         )
         if unmatched:
             all_unmatched[roster.roster_id] = unmatched
+        for d in discrepancies:
+            seen_discrepancies[d["Player"]] = d
 
         result = simulate_team(team_data, n_sims, n_weeks, use_greedy, rng)
         result.n_unmatched = len(unmatched)
@@ -229,11 +247,11 @@ def run_simulation(
 
     if all_unmatched:
         print(f"\nWarning: {sum(len(v) for v in all_unmatched.values())} players had no projection match.")
-        print("These players contribute 0 pts. Check for name/team mismatches.")
         for roster_id, names in all_unmatched.items():
             if names:
                 sample = names[:5]
                 print(f"  Roster {roster_id}: {', '.join(sample)}" + (f" (+{len(names)-5} more)" if len(names) > 5 else ""))
 
     results.sort(key=lambda r: r.mean_maxpf)
-    return results
+    disc_list = sorted(seen_discrepancies.values(), key=lambda d: abs(float(d["Diff"].rstrip("%"))), reverse=True)
+    return results, disc_list
