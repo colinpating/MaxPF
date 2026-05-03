@@ -84,9 +84,11 @@ def cached_load_projections(pdf_bytes: bytes, scoring_settings_json: str):
         os.unlink(tmp_path)
 
 @st.cache_data(show_spinner="Fetching Sleeper projections...")
-def cached_fetch_sleeper_proj(season: int, scoring_format: str) -> dict:
+def cached_fetch_sleeper_proj(season: int, scoring_settings_json: str) -> tuple[dict, dict]:
+    import json
     from projections import fetch_sleeper_projections
-    return fetch_sleeper_projections(season, scoring_format)
+    scoring_settings = json.loads(scoring_settings_json)
+    return fetch_sleeper_projections(season, scoring_settings)
 
 @st.cache_data(show_spinner="Computing empirical CVs from historical data...")
 def cached_compute_cvs(hist_season: int, scoring_format: str) -> dict:
@@ -255,9 +257,9 @@ if run_btn:
         import projections as proj_mod
         scoring_format = proj_mod.get_scoring_format(league.scoring_settings)
         with st.spinner("Fetching Sleeper projections..."):
-            sleeper_proj = cached_fetch_sleeper_proj(int(league.season or season), scoring_format)
+            sleeper_proj, sleeper_ppr = cached_fetch_sleeper_proj(int(league.season or season), scoring_json)
         if sleeper_proj:
-            st.info(f"Averaging Clay + Sleeper projections ({len(sleeper_proj):,} Sleeper players, {scoring_format})")
+            st.info(f"Averaging Clay + Sleeper projections ({len(sleeper_proj):,} Sleeper players, adjusted for league scoring)")
         else:
             st.warning("Sleeper projections unavailable — using Clay only")
 
@@ -288,6 +290,7 @@ if run_btn:
             progress_callback=on_progress,
             sleeper_proj=sleeper_proj,
             empirical_cvs=empirical_cvs,
+            sleeper_ppr=sleeper_ppr,
         )
 
         progress_bar.progress(1.0, text="Done!")

@@ -54,6 +54,7 @@ def build_team_sim_data(
     include_ir: bool = False,
     sleeper_proj: dict[str, float] | None = None,
     empirical_cvs: dict | None = None,
+    sleeper_ppr: dict[str, float] | None = None,
 ) -> tuple[TeamSimData, list[str], list[dict]]:
     """
     Returns (TeamSimData, list_of_unmatched_player_names).
@@ -84,7 +85,7 @@ def build_team_sim_data(
         if not position:
             continue
 
-        proj = match_sleeper_player(pid, sleeper_player, projections, sleeper_proj)
+        proj = match_sleeper_player(pid, sleeper_player, projections, sleeper_proj, sleeper_ppr)
         if proj is None or proj.pts_per_game <= 0:
             pts_pg = 0.0
             std_pg = 0.0
@@ -217,6 +218,7 @@ def run_simulation(
     progress_callback=None,
     sleeper_proj: dict[str, float] | None = None,
     empirical_cvs: dict | None = None,
+    sleeper_ppr: dict[str, float] | None = None,
 ) -> tuple[list[TeamResult], list[dict]]:
     lineup_slots = build_lineup_slots(roster_positions)
     print(f"\nLineup slots: {[s.slot_name for s in lineup_slots]}")
@@ -231,7 +233,7 @@ def run_simulation(
     iterable = tqdm(rosters, desc="Teams", unit="team") if progress_callback is None else rosters
     for i, roster in enumerate(iterable):
         team_data, unmatched, discrepancies = build_team_sim_data(
-            roster, players_db, projections, lineup_slots, include_ir, sleeper_proj, empirical_cvs
+            roster, players_db, projections, lineup_slots, include_ir, sleeper_proj, empirical_cvs, sleeper_ppr
         )
         if unmatched:
             all_unmatched[roster.roster_id] = unmatched
