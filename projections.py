@@ -293,7 +293,7 @@ def download_pdf(url: str = ESPN_PDF_URL) -> str:
 # ── Sleeper projections ────────────────────────────────────────────────────────
 
 def get_scoring_format(scoring_settings: dict) -> str:
-    """Map league scoring settings to Sleeper's pts field name."""
+    """Map league scoring settings to Sleeper's pts field name (used for CV lookups)."""
     rec = float(scoring_settings.get("rec", 0) or 0)
     if rec >= 1.0:
         return "pts_ppr"
@@ -302,23 +302,40 @@ def get_scoring_format(scoring_settings: dict) -> str:
     return "pts_std"
 
 
-def fetch_sleeper_projections(season: int, scoring_format: str = "pts_ppr") -> dict[str, float]:
+def compute_pts_from_stats(stats: dict, scoring_settings: dict) -> float:
     """
-    Fetch Sleeper week-1 projections as a per-game proxy.
-    Returns {player_id: pts_per_game}. Empty dict on failure.
-    Results cached for 7 days.
+    Compute league-specific fantasy points from raw Sleeper stat projections.
+
+    Iterates over scoring_settings keys (e.g. "rec", "rec_yd", "bonus_rec_te")
+    and multiplies each by the corresponding per-game stat value. Handles all
+    custom scoring including TE premium, 0.5 PPR, passing bonuses, etc.
+    """
+    total = 0.0
+    for key, setting_val in scoring_settings.items():
+        if not setting_val:
+            continue
+        stat_val = stats.get(key)
+        if stat_val:
+            total += float(stat_val) * float(setting_val)
+    return total
+
+
+def _fetch_sleeper_raw_stats(season: int) -> dict[str, dict]:
+    """
+    Fetch and cache per-game raw Sleeper projection stats.
+    Returns {player_id: {stat_key: per_game_value}}.
+    Tries season-total endpoint first (normalized by gp), then week-1 as fallback.
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
-    cache_path = os.path.join(CACHE_DIR, f"sleeper_proj_{season}_{scoring_format}.json")
+    cache_path = os.path.join(CACHE_DIR, f"sleeper_raw_{season}.json")
     if os.path.exists(cache_path):
         if (time.time() - os.path.getmtime(cache_path)) / 86400 < 7:
             with open(cache_path, encoding="utf-8") as f:
                 return json.load(f)
 
-    # Try season-total endpoint first, then weekly as fallback
     urls = [
-        (f"{SLEEPER_BASE}/projections/nfl/regular/{season}", True),   # season: divide by gp
-        (f"{SLEEPER_BASE}/projections/nfl/regular/{season}/1", False), # week 1: already per-game
+        (f"{SLEEPER_BASE}/projections/nfl/regular/{season}", True),
+        (f"{SLEEPER_BASE}/projections/nfl/regular/{season}/1", False),
         (f"{SLEEPER_BASE}/projections/nfl/{season}/1", False),
     ]
     for url, is_season in urls:
@@ -333,24 +350,65 @@ def fetch_sleeper_projections(season: int, scoring_format: str = "pts_ppr") -> d
             for pid, stats in data.items():
                 if not isinstance(stats, dict):
                     continue
-                pts = float(stats.get(scoring_format) or stats.get("pts_ppr") or 0)
-                if pts <= 0:
-                    continue
+                per_game: dict[str, float] = {}
                 if is_season:
-                    gp = float(stats.get("gp") or 17)
-                    result[pid] = pts / gp
+                    gp = max(float(stats.get("gp") or 17), 1.0)
+                    for k, v in stats.items():
+                        if k == "gp":
+                            continue
+                        try:
+                            per_game[k] = float(v) / gp
+                        except (TypeError, ValueError):
+                            pass
                 else:
-                    result[pid] = pts
+                    for k, v in stats.items():
+                        try:
+                            per_game[k] = float(v)
+                        except (TypeError, ValueError):
+                            pass
+                # Keep players with any meaningful pts projection
+                if per_game.get("pts_ppr", 0) > 0 or per_game.get("pts_std", 0) > 0:
+                    result[pid] = per_game
             if result:
                 with open(cache_path, "w", encoding="utf-8") as f:
                     json.dump(result, f)
-                print(f"Fetched {len(result)} Sleeper projections ({season}, {scoring_format})")
+                print(f"Fetched raw Sleeper stats for {len(result)} players ({season})")
                 return result
         except Exception:
             continue
 
     print(f"Warning: Sleeper projections unavailable for {season} — using Clay only")
     return {}
+
+
+def fetch_sleeper_projections(
+    season: int,
+    scoring_settings: dict,
+) -> tuple[dict[str, float], dict[str, float]]:
+    """
+    Compute league-specific and PPR fantasy points per game from Sleeper raw stats.
+
+    Returns (league_ppg, ppr_ppg):
+    - league_ppg: computed from raw stats × scoring_settings (handles TE premium, 0.5 PPR, etc.)
+    - ppr_ppg: Sleeper's pre-computed pts_ppr, used to ratio-adjust Clay's PPR projections
+    """
+    raw = _fetch_sleeper_raw_stats(season)
+    if not raw:
+        return {}, {}
+
+    league_ppg: dict[str, float] = {}
+    ppr_ppg: dict[str, float] = {}
+
+    for pid, stats in raw.items():
+        league_pts = compute_pts_from_stats(stats, scoring_settings)
+        ppr_pts = float(stats.get("pts_ppr") or 0)
+        if league_pts > 0:
+            league_ppg[pid] = league_pts
+        if ppr_pts > 0:
+            ppr_ppg[pid] = ppr_pts
+
+    print(f"Computed league projections for {len(league_ppg)} Sleeper players ({season})")
+    return league_ppg, ppr_ppg
 
 
 # ── Load + match ───────────────────────────────────────────────────────────────
@@ -383,6 +441,7 @@ def match_sleeper_player(
     sleeper_player: dict,
     projections: dict[str, PlayerProjection],
     sleeper_proj: dict[str, float] | None = None,
+    sleeper_ppr: dict[str, float] | None = None,
 ) -> PlayerProjection | None:
     position = sleeper_player.get("position", "")
     team = normalize_team(sleeper_player.get("team") or "")
@@ -423,29 +482,37 @@ def match_sleeper_player(
                         clay_proj = v
                         break
 
-    sleeper_ppg = float((sleeper_proj or {}).get(player_id) or 0)
+    sleeper_league_ppg = float((sleeper_proj or {}).get(player_id) or 0)
+    sleeper_ppr_ppg = float((sleeper_ppr or {}).get(player_id) or 0)
 
-    if clay_proj is not None and sleeper_ppg > 0:
-        avg_ppg = (clay_proj.pts_per_game + sleeper_ppg) / 2
+    if clay_proj is not None and sleeper_league_ppg > 0:
+        # Adjust Clay's PPR projection to league scoring using Sleeper's PPR→league ratio.
+        # Sleeper stats include position-specific bonus fields (e.g. bonus_rec_te) so the
+        # ratio naturally captures TE premium, 0.5 PPR, and any other custom scoring rules.
+        if sleeper_ppr_ppg > 0:
+            clay_league_ppg = clay_proj.pts_per_game * (sleeper_league_ppg / sleeper_ppr_ppg)
+        else:
+            clay_league_ppg = clay_proj.pts_per_game
+        avg_ppg = (clay_league_ppg + sleeper_league_ppg) / 2
         return dc_replace(
             clay_proj,
             pts_per_game=avg_ppg,
             pts_season=avg_ppg * clay_proj.games,
-            clay_pts_per_game=clay_proj.pts_per_game,
-            sleeper_pts_per_game=sleeper_ppg,
+            clay_pts_per_game=clay_league_ppg,
+            sleeper_pts_per_game=sleeper_league_ppg,
             source="average",
         )
     elif clay_proj is not None:
         return clay_proj
-    elif sleeper_ppg > 0:
+    elif sleeper_league_ppg > 0:
         return PlayerProjection(
             player_name=full_name,
             team=team,
             position=position,
             games=17.0,
-            pts_season=sleeper_ppg * 17,
-            pts_per_game=sleeper_ppg,
-            sleeper_pts_per_game=sleeper_ppg,
+            pts_season=sleeper_league_ppg * 17,
+            pts_per_game=sleeper_league_ppg,
+            sleeper_pts_per_game=sleeper_league_ppg,
             source="sleeper",
         )
 
